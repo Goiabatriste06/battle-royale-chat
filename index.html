@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Battle Royale do Chat</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#05050c;overflow:hidden;font-family:system-ui,"Segoe UI",Roboto,sans-serif}
+  #wrap{height:100%;display:flex;align-items:center;justify-content:center}
+  canvas{width:min(100vw,calc(100vh * 9 / 16));height:auto;display:block;background:#0b0b18}
+  #dev{display:none;position:fixed;left:10px;top:10px;background:#000d;color:#fff;padding:12px;border-radius:10px;font-size:13px;z-index:10;width:220px}
+  #dev button{display:block;width:100%;margin:5px 0;padding:7px;border:0;border-radius:6px;background:#2d2d55;color:#fff;cursor:pointer}
+  #dev button:hover{background:#44448a}
+  #dev small{opacity:.7;display:block;margin-top:6px;line-height:1.45}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="720" height="1280"></canvas></div>
+
+<div id="dev">
+  <b>🧪 Modo teste</b>
+  <button onclick="Test.viewers(30)">+30 espectadores (no lobby)</button>
+  <button onclick="Test.auto()" id="btnAuto">Jogadores automáticos: OFF</button>
+  <button onclick="Test.gift()">🎁 Presente aleatório</button>
+  <button onclick="Test.likes()">❤️ Chuva de curtidas</button>
+  <button onclick="Test.follow()">➕ Seguir aleatório</button>
+  <button onclick="skipPhase()">⏭ Pular fase</button>
+  <button onclick="resetSeason()">♻ Zerar temporada</button>
+  <small>T = mostra/esconde<br>Espaço = pular fase<br>URL: ?speed=3 acelera tudo</small>
+</div>
+
+<script>
+/* ============================  CONFIGURAÇÕES  ============================ */
+const qs = new URLSearchParams(location.search);
+const SP = +qs.get('speed') || 1;
+const CFG = {
+  ws: qs.get('ws') || 'ws://localhost:21213/',   // WebSocket do TikFinity
+  matches: +qs.get('matches') || 3,              // partidas por temporada
+  maxPlayers: 140,                               // máximo de jogadores por partida
+  minPlayers: 2,                                 // mínimo pra largar
+  maxRounds: 10,
+
+  // duração das fases (segundos)
+  lobby: 30, intro: 4, zona: 18, maratona: 15, roleta: 8,
+  reveal: 6, final: 25, matchResult: 12, seasonResult: 20,
+
+  commentCD: 600,          // ms entre comentários que contam
+  shieldMax: 3,            // máximo de escudos por jogador
+  likesPerShield: 30,      // curtidas acumuladas pra ganhar 1 escudo
+  bigGift: 50,             // diamantes que dão 2 escudos
+
+  cutMaratona: 0.30,       // % eliminados na maratona
+  cutRoleta: 0.25,         // % eliminados na roleta
+  surviveRoundPts: 5,      // pontos por rodada sobrevivida
+  placePts: [100, 70, 50, 40, 30, 25, 20, 15, 12, 10]  // pontos por colocação (1º ao 10º)
+};
+const dur = n => CFG[n] / SP;
+
+/* ============================  ESTADO  ============================ */
+const W = 720, H = 1280;
+const ARENA = { x: 30, y: 250 }, QW = 330, QH = 290;
+const ZCOL = ['#ff5d73', '#4dd2ff', '#ffd23f', '#7dffb0'];
+const TYPES = {
+  zona:     { n: 'ZONA DE PERIGO',   e: '🌪️', d: 'Digita !1 !2 !3 !4 pra fugir da tempestade' },
+  maratona: { n: 'MARATONA DO CHAT', e: '🔥', d: 'Comenta e curte! Quem tiver menos atividade cai' },
+  roleta:   { n: 'ROLETA DA SORTE',  e: '🎰', d: 'Pura sorte… só o escudo 🛡️ salva' },
+  raio:     { n: 'RAIO ALEATÓRIO',   e: '⚡', d: 'A tempestade escolheu no susto' }
+};
+const PATTERN = ['zona', 'maratona', 'zona', 'roleta'];
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const players = new Map();
+let phase = 'lobby', phaseT = performance.now(), phaseDur = 30;
+let M = { round: 0, type: 'zona', hit: [], fin: [], podium: [], tag: '' };
+let feed = [], confetti = [], joinSeq = 0, connected = false;
+const now = () => performance.now();
+
+/* ---------- persistência da temporada ---------- */
+let S = { season: 1, match: 1, pts: {}, hall: [] };
+try { const raw = localStorage.getItem('br_season'); if (raw) S = Object.assign(S, JSON.parse(raw)); } catch (e) {}
+const save = () => { try { localStorage.setItem('br_season', JSON.stringify(S)); } catch (e) {} };
+function addPts(p, n) {
+  const e = S.pts[p.id] || (S.pts[p.id] = { name: p.name, pic: p.pic, pts: 0 });
+  e.pts += n; e.name = p.name; e.pic = p.pic || e.pic;
+}
+const seasonBoard = () => Object.entries(S.pts).map(([id, e]) => ({ id, ...e })).sort((a, b) => b.pts - a.pts);
+
+/* ---------- utilidades ---------- */
+const imgs = new Map();
+function getImg(url) {
+  if (!url) return null;
+  let im = imgs.get(url);
+  if (!im) { im = new Image(); im.ok = false; im.onload = () => im.ok = true; im.src = url; imgs.set(url, im); }
+  return im.ok ? im : null;
+}
+const hueOf = s => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
+const clip = (s, n) => String(s).length > n ? String(s).slice(0, n - 1) + '…' : String(s);
+const shuffle = a => { a = [...a]; for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; };
+const all = () => [...players.values()];
+const inList = () => all().filter(p => p.in);
+const aliveList = () => all().filter(p => p.in && p.alive);
+function say(text) { feed.unshift({ text, t: now() }); if (feed.length > 12) feed.pop(); }
+
+/* ============================  JOGO  ============================ */
+function newPlayer(u) {
+  return { id: u.id, name: u.name || u.id, pic: u.pic || '', hue: hueOf(u.id),
+    in: false, alive: false, dying: false, zone: 0, join: 0, x: null, y: null, tx: 0, ty: 0, r: 20,
+    sh: 0, life: 0, lifeUsed: false, pending: false, likeAcc: 0,
+    act: 0, tot: 0, fp: 0, rnd: 0, place: 0, survived: 0, mpts: 0,
+    lastC: 0, savedAt: 0, dyIdx: 0 };
+}
+const Game = {
+  ensure(u) {
+    if (!u.id) return null;
+    let p = players.get(u.id);
+    if (!p) { if (players.size > CFG.maxPlayers * 3) return null; p = newPlayer(u); players.set(u.id, p); }
+    else if (u.pic && !p.pic) p.pic = u.pic;
+    if (phase === 'lobby' && !p.in && inList().length < CFG.maxPlayers) {
+      p.in = true; p.alive = true; p.zone = Math.random() * 4 | 0; p.join = ++joinSeq;
+      say('👋 ' + p.name + ' entrou na arena');
+    }
+    return p;
+  },
+  shield(p, n) {
+    const before = p.sh; p.sh = Math.min(CFG.shieldMax, p.sh + n);
+    if (p.sh > before && p.in) say('🛡️ ' + p.name + ' ganhou escudo');
+  }
+};
+
+function setPhase(name) {
+  phase = name; phaseT = now();
+  phaseDur = ({ lobby: dur('lobby'), intro: dur('intro'), action: dur(M.type === 'raio' ? 'roleta' : M.type),
+    reveal: dur('reveal'), final: dur('final'), matchResult: dur('matchResult'), seasonResult: dur('seasonResult') })[name];
+  if (name === 'lobby') newMatch();
+  if (name === 'intro') startRound();
+  if (name === 'final') startFinal();
+}
+function newMatch() {
+  M = { round: 0, type: 'zona', hit: [], fin: [], podium: [], tag: '' };
+  for (const [id, p] of players) {
+    if (!(S.pts[id] && S.pts[id].pts > 0) && !p.sh) { players.delete(id); continue; }
+    Object.assign(p, { in: false, alive: false, dying: false, life: 0, lifeUsed: false, pending: false,
+      act: 0, tot: 0, fp: 0, place: 0, survived: 0, mpts: 0, x: null, y: null });
+  }
+  feed = []; say('🚪 Partida ' + S.match + ' aberta! Comenta pra entrar');
+}
+function startRound() {
+  M.round++; M.hit = [];
+  M.type = PATTERN[(M.round - 1) % PATTERN.length];
+  for (const p of all()) {
+    p.dying = false; p.act = 0; p.rnd = Math.random();
+    if (p.in && p.pending) { p.pending = false; p.alive = true; p.place = 0; p.zone = Math.random() * 4 | 0; say('❤️ ' + p.name + ' voltou com a vida extra!'); }
+  }
+}
+function nextStep() {
+  const a = aliveList();
+  if (a.length <= 1) return endMatch(a[0] || null);
+  if (a.length <= 3 || M.round >= CFG.maxRounds) return setPhase('final');
+  setPhase('intro');
+}
+function resolve() {
+  const alive = aliveList(); const t = now();
+  let victims = [];
+  const pick = (arr, k) => shuffle(arr).slice(0, k);
+  if (M.type === 'zona') {
+    const occ = [0, 1, 2, 3].filter(z => alive.some(p => p.zone === z));
+    if (occ.length < 2) { M.type = 'raio'; victims = pick(alive, Math.max(1, Math.ceil(alive.length * 0.3))); }
+    else {
+      const k = Math.min(occ.length - 1, alive.length > 24 ? 1 : 2);
+      M.hit = shuffle(occ).slice(0, k);
+      victims = alive.filter(p => M.hit.includes(p.zone));
+    }
+  } else if (M.type === 'maratona') {
+    victims = [...alive].sort((a, b) => a.act - b.act || a.rnd - b.rnd).slice(0, Math.max(1, Math.ceil(alive.length * CFG.cutMaratona)));
+  } else {
+    victims = pick(alive, Math.max(1, Math.ceil(alive.length * CFG.cutRoleta)));
+  }
+  if (victims.length >= alive.length) victims.pop();             // nunca zera a arena
+  let i = 0, saved = 0;
+  for (const v of victims) {
+    if (v.sh > 0) { v.sh--; v.savedAt = t; saved++; say('🛡️ ' + v.name + ' foi salvo pelo escudo!'); continue; }
+    v.alive = false; v.dying = true; v.dyIdx = i++;
+    if (v.life > 0) { v.life--; v.pending = true; }
+  }
+  const after = aliveList();
+  for (const p of all()) if (p.dying) p.place = after.length + 1;
+  for (const p of after) p.survived++;
+  M.tag = `☠️ ${i} eliminado(s)` + (saved ? `  •  🛡️ ${saved} salvo(s)` : '');
+  if (i) say('☠️ ' + i + ' caíram na rodada ' + M.round);
+}
+function startFinal() {
+  const a = aliveList().sort((x, y) => y.tot - x.tot);
+  M.fin = a.slice(0, 3).map(p => ({ p, cheer: 0 }));
+  for (const p of a.slice(3)) { p.alive = false; p.place = 4; }
+  for (const p of all()) { p.fp = 0; p.dying = false; }
+  say('⚔️ Duelo final começou!');
+}
+const power = f => f.p.fp + f.cheer * 2;
+function endFinal() {
+  const ranked = [...M.fin].sort((a, b) => power(b) - power(a) || Math.random() - .5);
+  ranked.forEach((f, i) => { f.p.place = i + 1; f.p.alive = i === 0; });
+  endMatch(ranked[0].p);
+}
+function endMatch(winner) {
+  if (winner) winner.place = 1;
+  const part = inList();
+  for (const p of part) {
+    const place = p.place || 1;
+    p.mpts = (CFG.placePts[place - 1] || 0) + p.survived * CFG.surviveRoundPts;
+    if (p.mpts) addPts(p, p.mpts);
+  }
+  M.podium = part.sort((a, b) => (a.place || 99) - (b.place || 99) || b.mpts - a.mpts).slice(0, 3)
+    .map(p => ({ name: p.name, pic: p.pic, hue: p.hue, line: `+${p.mpts} pts` }));
+  save();
+  if (winner) { say('🏆 ' + winner.name + ' venceu a partida!'); boom(); }
+  setPhase('matchResult');
+}
+function boom() {
+  for (let i = 0; i < 170; i++) confetti.push({ x: W / 2, y: 460, vx: (Math.random() - .5) * 20, vy: -Math.random() * 20 - 4,
+    c: `hsl(${Math.random() * 360},90%,60%)`, s: 6 + Math.random() * 8, r: Math.random() * 6 });
+}
+function endSeason() {
+  S.season++; S.match = 1; S.pts = {}; save();
+}
+
+/* ---------- máquina de fases ---------- */
+function tick(t) {
+  if ((t - phaseT) / 1000 < phaseDur) return;
+  if (phase === 'lobby') {
+    if (inList().length < CFG.minPlayers) { phaseT = t; return; }      // espera mais gente
+    nextStep();
+  } else if (phase === 'intro') setPhase('action');
+  else if (phase === 'action') { resolve(); setPhase('reveal'); }
+  else if (phase === 'reveal') { for (const p of all()) p.dying = false; nextStep(); }
+  else if (phase === 'final') endFinal();
+  else if (phase === 'matchResult') {
+    if (S.match < CFG.matches) { S.match++; save(); setPhase('lobby'); }
+    else { const top = seasonBoard()[0]; if (top) { S.hall.unshift({ season: S.season, name: top.name, pts: top.pts }); S.hall = S.hall.slice(0, 20); } save(); boom(); setPhase('seasonResult'); }
+  } else if (phase === 'seasonResult') { endSeason(); setPhase('lobby'); }
+}
+function skipPhase() { phaseT = now() - phaseDur * 1000 - 1; }
+function resetSeason() { S = { season: 1, match: 1, pts: {}, hall: S.hall }; save(); players.clear(); setPhase('lobby'); }
+
+/* ============================  EVENTOS DO TIKTOK  ============================ */
+function userOf(d) {
+  return { id: d.uniqueId || d.userId || d.nickname, name: d.nickname || d.uniqueId,
+           pic: d.profilePictureUrl || (d.profilePicture && d.profilePicture.url && d.profilePicture.url[0]) || '' };
+}
+const isFinalist = p => M.fin.some(f => f.p === p);
+function handle(msg) {
+  const ev = msg.event, d = msg.data || {};
+  if (!['chat', 'gift', 'like', 'follow', 'share'].includes(ev)) return;
+  const p = Game.ensure(userOf(d)); if (!p) return;
+  const t = now();
+  const playing = p.in && p.alive && phase === 'action';
+  const fin = phase === 'final' ? M.fin.find(f => f.p === p) : null;
+
+  if (ev === 'chat') {
+    const text = String(d.comment || '').trim().toLowerCase();
+    const m = text.match(/^!?([1-4])$/);
+    if (phase === 'final') {
+      if (fin) { if (t - p.lastC >= CFG.commentCD * .6) { p.lastC = t; p.fp += 1; } }
+      else if (m && t - p.lastC >= 800) { p.lastC = t; const f = M.fin[+m[1] - 1]; if (f) f.cheer++; }
+      return;
+    }
+    if (!playing) return;
+    if (M.type === 'zona' && m) { p.zone = +m[1] - 1; return; }
+    if (t - p.lastC >= CFG.commentCD) { p.lastC = t; p.act++; p.tot++; }
+  } else if (ev === 'like') {
+    const n = d.likeCount || 1;
+    if (p.in) { p.likeAcc += n; while (p.likeAcc >= CFG.likesPerShield) { p.likeAcc -= CFG.likesPerShield; Game.shield(p, 1); } }
+    if (playing) { const a = Math.min(3, n * .2); p.act += a; p.tot += a; }
+    if (fin) p.fp += n * .5;
+  } else if (ev === 'gift') {
+    if (d.giftType === 1 && d.repeatEnd === false) return;
+    const dia = (d.diamondCount || 1) * (d.repeatCount || 1);
+    say('🎁 ' + p.name + ' mandou ' + (d.giftName || 'presente') + '!');
+    if (p.in) Game.shield(p, dia >= CFG.bigGift ? 2 : 1);
+    if (playing) { p.act += 5; p.tot += 5; }
+    if (fin) p.fp += dia;
+  } else if (ev === 'follow') {
+    if (p.in && !p.lifeUsed && phase !== 'final') {
+      p.lifeUsed = true;
+      if (!p.alive && !p.dying) p.pending = true; else p.life++;
+      say('➕ ' + p.name + ' seguiu → vida extra ❤️');
+    }
+  } else if (ev === 'share') { if (p.in) Game.shield(p, 1); }
+}
+let ws;
+function connect() {
+  try { ws = new WebSocket(CFG.ws); } catch (e) { return setTimeout(connect, 3000); }
+  ws.onopen = () => connected = true;
+  ws.onclose = () => { connected = false; setTimeout(connect, 3000); };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  ws.onmessage = e => { try { handle(JSON.parse(e.data)); } catch (err) {} };
+}
+connect();
+
+/* ============================  MODO TESTE  ============================ */
+const NAMES = ['Mestre','Ana','Bruno','Carla','Dudu','Fer','Gabi','Hugo','Isa','João','Kaká','Lari','Marcos','Nanda','Otávio','Paty','Rafa','Sam','Tati','Vini','Yuri','Zé'];
+const Test = {
+  timer: null,
+  viewers(n) { for (let i = 0; i < n; i++) { const nm = NAMES[Math.random() * NAMES.length | 0] + (Math.random() * 999 | 0);
+    handle({ event: 'chat', data: { uniqueId: nm.toLowerCase(), nickname: nm, comment: 'oi' } }); } },
+  pickId() { const ids = inList().map(p => p.id); return ids[Math.random() * ids.length | 0]; },
+  auto() {
+    const b = document.getElementById('btnAuto');
+    if (this.timer) { clearInterval(this.timer); this.timer = null; b.textContent = 'Jogadores automáticos: OFF'; return; }
+    b.textContent = 'Jogadores automáticos: ON';
+    this.timer = setInterval(() => {
+      if (phase === 'lobby' && inList().length < 20) this.viewers(6);
+      for (let i = 0; i < 8; i++) {
+        const id = all()[Math.random() * players.size | 0]?.id; if (!id) continue;
+        const nm = players.get(id).name;
+        const c = (phase === 'final' || M.type === 'zona') && Math.random() < .6 ? String(1 + (Math.random() * 4 | 0)) : 'vai!';
+        handle({ event: 'chat', data: { uniqueId: id, nickname: nm, comment: c } });
+      }
+      if (Math.random() < .08) this.gift(); if (Math.random() < .04) this.follow();
+    }, 500);
+  },
+  gift() { const id = this.pickId(); if (id) handle({ event: 'gift', data: { uniqueId: id, nickname: players.get(id).name, giftName: 'Rose', diamondCount: 1 + (Math.random() * 80 | 0), repeatCount: 1, giftType: 0 } }); },
+  likes() { for (const p of inList()) handle({ event: 'like', data: { uniqueId: p.id, nickname: p.name, likeCount: 12 } }); },
+  follow() { const dead = all().filter(p => p.in && !p.alive && !p.lifeUsed); const p = dead[0] || players.get(this.pickId()); if (p) handle({ event: 'follow', data: { uniqueId: p.id, nickname: p.name } }); }
+};
+addEventListener('keydown', e => {
+  if (e.key === 't' || e.key === 'T') { const d = document.getElementById('dev'); d.style.display = d.style.display === 'block' ? 'none' : 'block'; }
+  if (e.code === 'Space') { e.preventDefault(); skipPhase(); }
+});
+
+/* ============================  DESENHO  ============================ */
+function txt(s, x, y, size, color = '#fff', align = 'center', weight = '800') {
+  ctx.font = `${weight} ${size}px system-ui,"Segoe UI",Roboto,"Apple Color Emoji","Segoe UI Emoji",sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.lineWidth = Math.max(3, size / 6); ctx.strokeStyle = '#000b'; ctx.lineJoin = 'round';
+  ctx.strokeText(s, x, y); ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function rr(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, r);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 3; ctx.stroke(); }
+}
+function face(pic, hue, name, x, y, r, ring, gray) {
+  ctx.save();
+  if (ring) { ctx.beginPath(); ctx.arc(x, y, r + 3, 0, 7); ctx.fillStyle = ring; ctx.fill(); }
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.clip();
+  if (gray) ctx.filter = 'grayscale(1) brightness(.6)';
+  const im = getImg(pic);
+  if (im) ctx.drawImage(im, x - r, y - r, r * 2, r * 2);
+  else { ctx.fillStyle = `hsl(${hue},70%,55%)`; ctx.fillRect(x - r, y - r, r * 2, r * 2); }
+  ctx.restore();
+  if (!getImg(pic)) txt((name[0] || '?').toUpperCase(), x, y + 1, r * 1.05);
+}
+
+function layout() {
+  const zs = [[], [], [], []];
+  for (const p of players.values()) if (p.in && (p.alive || p.dying)) zs[p.zone].push(p);
+  zs.forEach((arr, z) => {
+    arr.sort((a, b) => a.join - b.join);
+    const qx = ARENA.x + (z % 2) * QW, qy = ARENA.y + (z >> 1) * QH;
+    const n = Math.max(1, arr.length), pad = 36, aw = QW - 16, ah = QH - pad - 10;
+    const cols = Math.max(1, Math.ceil(Math.sqrt(n * aw / ah)));
+    const rows = Math.ceil(n / cols), cell = Math.min(aw / cols, ah / rows, 62);
+    arr.forEach((p, i) => {
+      const c = i % cols, r = (i / cols) | 0, inRow = r === rows - 1 ? n - r * cols : cols;
+      p.tx = qx + 8 + (aw - inRow * cell) / 2 + c * cell + cell / 2;
+      p.ty = qy + pad + (ah - rows * cell) / 2 + r * cell + cell / 2;
+      p.r = cell * .40;
+      if (p.x === null) { p.x = ARENA.x + QW; p.y = ARENA.y + QH; }
+    });
+  });
+}
+
+function drawArena(t) {
+  layout();
+  const counts = [0, 0, 0, 0];
+  for (const p of aliveList()) counts[p.zone]++;
+  const reveal = phase === 'reveal', elR = (t - phaseT) / 1000;
+  for (let z = 0; z < 4; z++) {
+    const qx = ARENA.x + (z % 2) * QW, qy = ARENA.y + (z >> 1) * QH;
+    const hit = reveal && M.hit.includes(z);
+    rr(qx + 3, qy + 3, QW - 6, QH - 6, 18, ZCOL[z] + '1c', ZCOL[z] + (phase === 'action' && M.type === 'zona' ? 'cc' : '66'));
+    txt(`ZONA ${z + 1}`, qx + 16, qy + 20, 20, ZCOL[z], 'left');
+    txt(String(counts[z]), qx + QW - 16, qy + 20, 22, '#fff', 'right');
+    if (reveal && M.type === 'zona') {
+      ctx.save(); ctx.globalAlpha = hit ? .25 + .2 * Math.sin(t / 90) : .1;
+      ctx.fillStyle = hit ? '#ff2040' : '#2ecc71'; ctx.beginPath(); ctx.roundRect(qx + 3, qy + 3, QW - 6, QH - 6, 18); ctx.fill(); ctx.restore();
+      if (elR > .5) txt(hit ? '🌪️ TEMPESTADE' : '✅ SEGURA', qx + QW / 2, qy + QH - 22, 22, hit ? '#ff7a8a' : '#7dffb0');
+    }
+  }
+  // jogadores
+  const alive = aliveList();
+  let cutSet = null, hl = null;
+  if (phase === 'action' && M.type === 'maratona') {
+    cutSet = new Set([...alive].sort((a, b) => a.act - b.act || a.rnd - b.rnd).slice(0, Math.max(1, Math.ceil(alive.length * CFG.cutMaratona))).map(p => p.id));
+  }
+  if (phase === 'action' && M.type === 'roleta' && alive.length) hl = alive[(t / 110 | 0) % alive.length].id;
+  for (const p of players.values()) {
+    if (!(p.in && (p.alive || p.dying))) continue;
+    p.x += (p.tx - p.x) * .15; p.y += (p.ty - p.y) * .15;
+    let ring = null, gray = false;
+    if (cutSet) ring = cutSet.has(p.id) ? '#ff4d6a' : '#3ddc84';
+    if (hl === p.id) ring = '#ffd23f';
+    let r = p.r;
+    if (p.dying) {
+      const started = (t - phaseT) / 1000 > .6 + p.dyIdx * .03;
+      gray = started; ring = started ? '#ff2040' : ring;
+    }
+    if (t - p.savedAt < 1600) { ring = '#4dd2ff'; r *= 1 + .15 * Math.sin(t / 60); }
+    face(p.pic, p.hue, p.name, p.x, p.y, r, ring, gray);
+    if (p.dying && gray) txt('✖', p.x, p.y, r * 1.3, '#ff3b57');
+    if (p.sh > 0 && !p.dying && r > 11) txt('🛡️', p.x + r * .75, p.y + r * .75, Math.max(12, r * .8));
+    if (p.life > 0 && !p.dying && r > 11) txt('❤️', p.x - r * .75, p.y + r * .75, Math.max(10, r * .65));
+    if (alive.length <= 12 && !p.dying) txt(clip(p.name, 9), p.x, p.y + r + 12, 14, '#fff', 'center', '700');
+  }
+  if (!alive.length && phase === 'lobby') txt('Comenta qualquer coisa pra entrar!', W / 2, ARENA.y + QH, 30, '#fff');
+}
+
+function drawFinal(t) {
+  const maxP = Math.max(10, ...M.fin.map(power));
+  M.fin.forEach((f, i) => {
+    const y = 262 + i * 200, p = f.p;
+    rr(30, y, 660, 184, 20, '#ffffff0d', ZCOL[i] + 'aa');
+    face(p.pic, p.hue, p.name, 110, y + 80, 56, ZCOL[i]);
+    txt(clip(p.name, 16), 190, y + 34, 30, '#fff', 'left');
+    txt(`Torcida: digita !${i + 1}`, 190, y + 70, 21, ZCOL[i], 'left', '700');
+    txt(`${Math.round(power(f))} pts`, 665, y + 34, 30, '#ffd23f', 'right');
+    rr(190, y + 105, 470, 26, 13, '#00000066');
+    f.w = (f.w || 0) + (power(f) / maxP - (f.w || 0)) * .12;
+    rr(190, y + 105, Math.max(14, 470 * f.w), 26, 13, ZCOL[i]);
+    txt(`${f.cheer} votos de torcida`, 190, y + 152, 18, '#ffffffbb', 'left', '600');
+    if (t - p.lastC < 250) txt('💥', 650, y + 150, 26);
+    if (p.sh > 0) txt('🛡️'.repeat(p.sh), 665, y + 152, 20, '#fff', 'right');
+  });
+}
+
+function podium(items, y0) {
+  const order = [1, 0, 2], hs = [150, 205, 115], cols = ['#d5dbe3', '#ffd23f', '#e08a4b'];
+  order.forEach((idx, slot) => {
+    const it = items[idx]; if (!it) return;
+    const x = 120 + slot * 240, h = hs[idx], top = y0 + 230 - h;
+    rr(x - 100, top, 200, h, 14, cols[idx] + '33', cols[idx]);
+    face(it.pic, it.hue || hueOf(it.name), it.name, x, top - 62, idx === 0 ? 58 : 46, cols[idx]);
+    if (idx === 0) txt('👑', x, top - 135, 40);
+    txt(['🥇', '🥈', '🥉'][idx], x, top + 36, 40);
+    txt(clip(it.name, 12), x, top + 80, 22);
+    txt(it.line, x, top + 108, 20, '#7dffb0');
+  });
+}
+
+function drawHud(t) {
+  const el = (t - phaseT) / 1000;
+  txt(`TEMPORADA ${S.season}  •  PARTIDA ${S.match}/${CFG.matches}` + (M.round && ['intro', 'action', 'reveal'].includes(phase) ? `  •  RODADA ${M.round}` : ''), W / 2, 30, 23, '#9aa4ff');
+  let title = '', sub = '', col = '#fff';
+  const ty = TYPES[M.type];
+  if (phase === 'lobby') { title = '🚪 SALA ABERTA'; sub = inList().length < CFG.minPlayers ? `Precisa de ${CFG.minPlayers}+ jogadores — comenta pra entrar!` : 'Comenta qualquer coisa pra entrar na arena!'; col = '#7dffb0'; }
+  else if (phase === 'intro') { title = `${ty.e} ${ty.n}`; sub = ty.d; col = '#ffd23f'; }
+  else if (phase === 'action') { title = `${ty.e} ${ty.n}`; sub = ty.d; col = '#ff7a59'; }
+  else if (phase === 'reveal') { title = '💥 RESULTADO'; sub = M.tag; col = '#ff5d73'; }
+  else if (phase === 'final') { title = '⚔️ DUELO FINAL'; sub = 'Finalistas: comentem! Torcida: vote com !1 !2 !3'; col = '#ffd23f'; }
+  else if (phase === 'matchResult') { title = '🏁 FIM DA PARTIDA'; sub = `Próxima partida em ${Math.max(0, Math.ceil(phaseDur - el))}s`; col = '#ffd23f'; }
+  else if (phase === 'seasonResult') { title = `🏆 CAMPEÃO DA TEMPORADA ${S.season}`; sub = 'Nova temporada já já!'; col = '#ffd23f'; }
+  txt(title, W / 2, 80, 42, col);
+  txt(sub, W / 2, 124, 23, '#ffffffdd', 'center', '600');
+  // barra de tempo
+  const f = Math.max(0, 1 - el / phaseDur);
+  rr(60, 156, 600, 14, 7, '#ffffff22'); rr(60, 156, Math.max(14, 600 * f), 14, 7, f < .25 ? '#ff4d6a' : '#4dd2ff');
+  if (['lobby', 'action', 'final'].includes(phase)) txt(Math.ceil(phaseDur - el) + 's', 660, 196, 22, '#fff', 'right');
+  // contadores
+  const inn = inList(), vivos = aliveList().length;
+  txt(`🟢 ${vivos} vivos   ☠️ ${inn.length - vivos} fora   👀 ${all().length - inn.length} na torcida`, W / 2, 214, 21, '#fff', 'center', '700');
+}
+
+function drawBottom(t) {
+  ctx.fillStyle = '#0009'; ctx.fillRect(0, 850, W, 430);
+  txt('🏅 RANKING DA TEMPORADA', 30, 880, 21, '#ffd23f', 'left');
+  const b = seasonBoard().slice(0, 8);
+  b.forEach((e, i) => txt(`${i + 1}. ${clip(e.name, 12)}`, 30, 918 + i * 32, 20, i < 3 ? '#fff' : '#ffffffcc', 'left', '700'));
+  b.forEach((e, i) => txt(`${e.pts}`, 335, 918 + i * 32, 20, '#7dffb0', 'right'));
+  if (!b.length) txt('Ninguém pontuou ainda…', 30, 918, 20, '#ffffff88', 'left', '600');
+  txt('📢 AO VIVO', 370, 880, 21, '#4dd2ff', 'left');
+  feed = feed.filter(f => t - f.t < 30000);
+  feed.slice(0, 8).forEach((f, i) => { ctx.globalAlpha = Math.max(.35, 1 - i * .09); txt(clip(f.text, 27), 370, 918 + i * 32, 18, '#fff', 'left', '600'); ctx.globalAlpha = 1; });
+  ctx.fillStyle = '#ffffff22'; ctx.fillRect(352, 870, 2, 280);
+  rr(30, 1188, 660, 58, 14, '#ffffff10');
+  txt('🎁 Presente = 🛡️ escudo   ❤️ 30 curtidas = 🛡️', W / 2, 1207, 20, '#fff', 'center', '700');
+  txt('➕ Seguir = ❤️ vida extra   ↗️ Compartilhar = 🛡️', W / 2, 1232, 20, '#fff', 'center', '700');
+  if (S.hall.length) txt(`👑 Último campeão: ${clip(S.hall[0].name, 14)} (T${S.hall[0].season})`, W / 2, 1264, 17, '#ffd23f', 'center', '600');
+}
+
+function frame() {
+  const t = now(); tick(t);
+  const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#1a1040'); g.addColorStop(1, '#08142b');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  drawHud(t);
+  if (phase === 'final') drawFinal(t);
+  else if (phase === 'matchResult') podium(M.podium.length ? M.podium : [], 330);
+  else if (phase === 'seasonResult') podium(seasonBoard().slice(0, 3).map(e => ({ name: e.name, pic: e.pic, line: e.pts + ' pts' })), 330);
+  else drawArena(t);
+  drawBottom(t);
+  confetti = confetti.filter(c => c.y < H + 20);
+  for (const c of confetti) { c.x += c.vx; c.y += c.vy; c.vy += .5; c.vx *= .99; c.r += .2;
+    ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.r); ctx.fillStyle = c.c; ctx.fillRect(-c.s / 2, -c.s / 4, c.s, c.s / 2); ctx.restore(); }
+  ctx.beginPath(); ctx.arc(W - 14, 14, 6, 0, 7); ctx.fillStyle = connected ? '#2ecc71' : '#e74c3c'; ctx.fill();
+  requestAnimationFrame(frame);
+}
+setPhase('lobby');
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
